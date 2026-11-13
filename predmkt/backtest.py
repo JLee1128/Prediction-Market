@@ -8,6 +8,7 @@ and it builds in adverse selection: we only get filled when the market moves aga
 """
 from __future__ import annotations
 
+import copy
 import math
 from collections import Counter, defaultdict
 from dataclasses import dataclass
@@ -21,6 +22,8 @@ from .fees import fee_per_contract, order_fee
 @dataclass
 class _Arrays:
     ts: np.ndarray
+    bid: np.ndarray
+    ask: np.ndarray
     bid_h: np.ndarray
     ask_l: np.ndarray
     px_l: np.ndarray
@@ -30,7 +33,8 @@ class _Arrays:
 
 def _arrays(g: pd.DataFrame) -> _Arrays:
     g = g.sort_values("ts")
-    return _Arrays(g["ts"].to_numpy(), g["bid_h"].to_numpy(dtype=float), g["ask_l"].to_numpy(dtype=float),
+    return _Arrays(g["ts"].to_numpy(), g["bid"].to_numpy(dtype=float), g["ask"].to_numpy(dtype=float),
+                   g["bid_h"].to_numpy(dtype=float), g["ask_l"].to_numpy(dtype=float),
                    g["px_l"].to_numpy(dtype=float), g["px_h"].to_numpy(dtype=float), int(g["close_ts"].iloc[0]))
 
 
@@ -129,9 +133,10 @@ def run_backtest(df: pd.DataFrame, cfg: dict, taker_coef: float, maker_coef: flo
             continue
 
         equity = bankroll + realized
+        size_base = equity if s.get("compound", False) else min(bankroll, equity)
         limit = min(s["max_per_market"], s["max_per_event"] - event_exposure[r.event_ticker],
                     s["max_open_exposure"] - open_exposure, equity - open_exposure)
-        stake = min(s["kelly_fraction"] * (edge / (1 - price)) * equity, limit)
+        stake = min(s["kelly_fraction"] * (edge / (1 - price)) * size_base, limit)
         count = math.floor(stake / (price + fee_per_contract(price, coef)))
         while count > 0 and count * price + order_fee(price, count, coef, cfg["fees"]["round_to"]) > limit + 1e-9:
             count -= 1  # caps include fees
@@ -140,6 +145,24 @@ def run_backtest(df: pd.DataFrame, cfg: dict, taker_coef: float, maker_coef: flo
             continue
 
         fill_t = t
+        delay = s.get("fill_delay_sec", 0)
+        if mode == "taker" and delay > 0:
+            # Latency test: decide at t, but the market order executes at the quote `delay` seconds later.
+            a = arrays[tk]
+            j = int(np.searchsorted(a.ts, t + delay, side="left"))
+            if j >= len(a.ts) or a.ts[j] >= a.close_ts:
+                continue
+            stake_dollars = count * price
+            price = (a.ask[j] if side == "yes" else 1 - a.bid[j]) + s["taker_slippage"]
+            if not (0 < price < 1):
+                continue
+            edge = q - price - fee_per_contract(price, coef)
+            fill_t = float(a.ts[j])
+            count = math.floor(min(stake_dollars, limit) / (price + fee_per_contract(price, coef)))
+            while count > 0 and count * price + order_fee(price, count, coef, cfg["fees"]["round_to"]) > limit + 1e-9:
+                count -= 1
+            if count < 1:
+                continue
         if mode == "maker":
             stats["orders"] += 1
             f = _maker_fill(arrays[tk], t, side, price, ttl_s)
@@ -172,6 +195,22 @@ def run_backtest(df: pd.DataFrame, cfg: dict, taker_coef: float, maker_coef: flo
     if mode == "maker":
         stats["fill_rate"] = stats["fills"] / stats["orders"] if stats["orders"] else float("nan")
     return trades, dict(stats)
+
+
+def longshot_baseline(df: pd.DataFrame, cfg: dict, taker_coef: float, max_price: float) -> tuple[pd.DataFrame, dict]:
+    """No-model benchmark: at each market's first decision minute, take any side whose taker price is
+    <= `max_price` and hold to settlement. Same rows, fees, slippage, delay and caps as the model strategy.
+    If the model cannot beat this, its P&L comes from cheap contracts winning, not from the model."""
+    d = df.reset_index(drop=True)   # rows are marked by label, so labels must be unique
+    first = d[d["p_model"].notna()].sort_values("ts").groupby("ticker").head(1)
+    yes = first.index[first["ask"] + cfg["strategy"]["taker_slippage"] <= max_price]
+    no = first.index[(1 - first["bid"]) + cfg["strategy"]["taker_slippage"] <= max_price].difference(yes)
+    d["p_model"] = np.nan
+    d.loc[yes, "p_model"] = 1.0   # certain YES -> buys YES (size then hits the per-market cap)
+    d.loc[no, "p_model"] = 0.0    # certain NO -> buys NO
+    c = copy.deepcopy(cfg)
+    c["strategy"].update(mode="taker", early_exit=False)
+    return run_backtest(d, c, taker_coef, 0.0, threshold=0.0)
 
 
 def tune_threshold(df_valid: pd.DataFrame, cfg: dict, taker_coef: float, maker_coef: float) -> tuple[float, pd.DataFrame]:

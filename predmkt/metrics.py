@@ -73,7 +73,7 @@ def log_loss(df: pd.DataFrame, pcol: str) -> float:
 def max_drawdown(pnl: pd.Series, bankroll: float) -> dict:
     """Largest peak-to-trough decline of cumulative P&L (series indexed by time, in order)."""
     if pnl.empty:
-        return {"max_dd": 0.0, "max_dd_pct": 0.0, "peak_ts": None, "trough_ts": None}
+        return {"max_dd": 0.0, "max_dd_pct": 0.0, "max_dd_pct_bankroll": 0.0, "peak_ts": None, "trough_ts": None}
     pnl = pnl.groupby(level=0).sum().sort_index()
     equity = np.concatenate([[bankroll], bankroll + pnl.cumsum().to_numpy()])
     times = [None, *pnl.index.tolist()]
@@ -86,6 +86,7 @@ def max_drawdown(pnl: pd.Series, bankroll: float) -> dict:
         return None if t is None else pd.to_datetime(t, unit="s", utc=True).strftime("%Y-%m-%d %H:%M")
 
     return {"max_dd": float(dd[i]), "max_dd_pct": float(dd[i] / peak[i] * 100),
+            "max_dd_pct_bankroll": float(dd[i] / bankroll * 100),
             "peak_ts": fmt(times[j]), "trough_ts": fmt(times[i])}
 
 

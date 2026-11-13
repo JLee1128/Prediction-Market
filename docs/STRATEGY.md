@@ -51,7 +51,7 @@ Every variable is scale-free (prices in cents, ratios, z-scores), so one model c
 | Price dynamics | mid change over 1/5/15 min; std of 1-min mid changes over 15 min; number of mid changes in 15 min; bid and ask high−low within the last minute |
 | Trade flow | trade-flow imbalance (buyer − seller aggressor volume) ÷ total over 1/5/15 min; trade counts; average trade size; largest-trade share; VWAP − mid |
 | Activity | log volume over 1/5/15 min; 5-min volume ÷ 60-min baseline; open-interest change over 5/15 min |
-| Clock | minutes to close (and log), hour of day, day of week |
+| Clock | minutes to close (and log). Hour of day and day of week are computed but excluded by default (`features.exclude`): on 120 days the model scored better without them. |
 | Underlying (crypto) | log(spot/strike); 60-min realized volatility; `spot_z` = log(spot/strike) ÷ (σ·√minutes left); `p_bs` = Φ(spot_z); `p_bs − mid`; spot returns over 1/5/15 min |
 
 **Needs the live recorder (history doesn't include order books)**
@@ -99,11 +99,13 @@ Also reported:
 - Brier score by time-to-close.
 - Hit rate, P&L per contract, daily Sharpe ratio.
 - Permutation feature importance.
+- **No-model baseline:** buy every side priced at or below 10¢ at each market's first decision minute, with the same fees, caps and test rows. On 120 days this simple rule made as much as the model, because cheap contracts right after the open have won more often than their price. The model has to beat it to count.
 
 **Gate before real money:** all must hold on test.
 - Model Brier < market Brier, with the event-bootstrap 95% CI of the difference below 0.
 - Net P&L > 0, with the event-bootstrap CI's lower bound near or above 0.
-- Max drawdown under 20%.
+- Net P&L above the no-model baseline.
+- Max drawdown under 20% of the starting $1,000.
 - Results hold on KXETHD with no retuning.
 
 Then paper-trade for 2 weeks before going live at the $1,000 cap.

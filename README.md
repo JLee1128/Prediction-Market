@@ -38,6 +38,8 @@ Everything tunable is in `config.yaml`: series, history length, decision window,
 - `features.feature_sets`: remove `spot` to test microstructure-only. `book` is used automatically once recorded order-book data exists.
 - `strategy.mode`: `taker` or `maker`.
 - `strategy.early_exit`: off by default, so positions are held to settlement.
+- `strategy.compound`: off by default, so bets are sized off the starting bankroll and profits are not reinvested.
+- `features.exclude`: features to leave out (day of week and hour of day by default).
 - `model.use_market_offset`: the model starts from the market's own probability and learns corrections to it.
 
 ## API key (only for `record --mode ws`, and for future order code)

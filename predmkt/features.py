@@ -46,6 +46,8 @@ def feature_columns(cfg: dict, df: pd.DataFrame | None = None) -> list[str]:
         cols += spot_features(w)
     if "book" in sets:
         cols += BOOK_FEATURES
+    exclude = set(cfg["features"].get("exclude") or [])
+    cols = [c for c in cols if c not in exclude]
     if df is not None:  # drop columns that are absent or entirely empty (e.g. no recorder data yet)
         cols = [c for c in cols if c in df.columns and df[c].notna().any()]
     return cols

@@ -14,7 +14,7 @@ import numpy as np  # noqa: E402
 import pandas as pd  # noqa: E402
 
 from . import metrics as M  # noqa: E402
-from .backtest import run_backtest, tune_threshold  # noqa: E402
+from .backtest import longshot_baseline, run_backtest, tune_threshold  # noqa: E402
 from .config import data_dir, project_path  # noqa: E402
 from .features import base_features, build_series_features, feature_columns, spot_features  # noqa: E402
 from .fees import load_fee_coefs  # noqa: E402
@@ -101,14 +101,19 @@ def run(cfg: dict, series: str, rebuild: bool = False, ablation: bool = False, m
     test_events.loc[~test_events.index.isin(test_rows.index), "p_model"] = np.nan
     trades, bstats = run_backtest(test_events, cfg, taker_coef, maker_coef, th)
     pnl = M.pnl_summary(trades, scfg["bankroll"], nb, seed)
+    bmax = ecfg.get("baseline_max_price", 0.10)
+    base_trades, _ = longshot_baseline(test_events, cfg, taker_coef, bmax)
+    base_pnl = M.pnl_summary(base_trades, scfg["bankroll"], nb, seed)
     imp = permutation_importance(booster, valid_rows, feats, cfg, seed)
 
     # ---- artifacts --------------------------------------------------------------------------------
     test_rows[["ticker", "event_ticker", "ts", "tte_min", "y", "bid", "ask", *pcols]].to_parquet(out / "test_predictions.parquet")
     trades.to_csv(out / "trades.csv", index=False)
-    _plots(out, calib, calib_mkt, trades, scfg["bankroll"])
-    gate = _gate(diff, pnl)
-    summary = {"series": series, "threshold": th, "brier_diff": diff, "pnl": pnl, "backtest_stats": bstats,
+    base_trades.to_csv(out / "baseline_trades.csv", index=False)
+    _plots(out, calib, calib_mkt, trades, scfg["bankroll"], base_trades)
+    gate = _gate(diff, pnl, base_pnl)
+    summary = {"series": series, "threshold": th, "brier_diff": diff, "pnl": pnl, "baseline_pnl": base_pnl,
+               "baseline_max_price": bmax, "backtest_stats": bstats,
                "gate": gate, "features": feats, "best_iteration": int(booster.best_iteration),
                "fee_coefs": {"taker": taker_coef, "maker": maker_coef}}
     (out / "summary.json").write_text(json.dumps(summary, indent=1, default=str))
@@ -147,7 +152,12 @@ def run(cfg: dict, series: str, rebuild: bool = False, ablation: bool = False, m
         "",
         f"Backtest counters: {bstats}",
         "",
-        "Net P&L includes fees and the spread. Drawdown is peak-to-trough of cumulative realized P&L. "
+        f"**No-model benchmark:** at each market's first decision minute, buy any side priced at or below {bmax:.2f}, "
+        "with the same fees, caps and test rows. If the model can't beat it, its P&L comes from cheap contracts winning, not from the model.",
+        _md(pd.DataFrame({"model": pnl, "no-model baseline": base_pnl}).loc[
+            [k for k in _COMPARE if k in pnl or k in base_pnl]], floatfmt="{:.2f}"),
+        "",
+        "Net P&L includes fees and the spread. Drawdown is peak-to-trough of cumulative realized P&L; the gate compares it with the starting bankroll. "
         "Entry regret = how much cheaper the same side was within the next "
         f"{scfg['regret_window_min']} minutes (hindsight).",
         "",
@@ -164,17 +174,23 @@ def run(cfg: dict, series: str, rebuild: bool = False, ablation: bool = False, m
     return out
 
 
-def _gate(diff: dict, pnl: dict) -> list[tuple[str, bool]]:
+_COMPARE = ["trades", "events_traded", "net_pnl", "net_pnl_ci_low", "net_pnl_ci_high", "pnl_per_contract_cents",
+            "hit_rate", "max_dd", "max_dd_pct_bankroll"]
+
+
+def _gate(diff: dict, pnl: dict, base_pnl: dict) -> list[tuple[str, bool]]:
     return [
         ("Model Brier beats market (95% CI below 0)", diff["ci_high"] < 0),
+        ("Net P&L beats the no-model long-shot baseline", pnl.get("net_pnl", 0) > base_pnl.get("net_pnl", 0)),
         ("Net P&L > 0 after fees", pnl.get("net_pnl", 0) > 0),
         ("Event-bootstrap P&L CI lower bound > 0", pnl.get("net_pnl_ci_low", -1) > 0),
-        ("Max drawdown < 20% of bankroll", pnl.get("max_dd_pct", 0) < 20),
+        ("Max drawdown < 20% of starting bankroll", pnl.get("max_dd_pct_bankroll", 0) < 20),
         ("At least 30 events traded", pnl.get("events_traded", 0) >= 30),
     ]
 
 
-def _plots(out: Path, calib: pd.DataFrame, calib_mkt: pd.DataFrame, trades: pd.DataFrame, bankroll: float) -> None:
+def _plots(out: Path, calib: pd.DataFrame, calib_mkt: pd.DataFrame, trades: pd.DataFrame, bankroll: float,
+           base_trades: pd.DataFrame | None = None) -> None:
     fig, ax = plt.subplots(figsize=(4.5, 4.5))
     ax.plot([0, 1], [0, 1], color="#999", lw=1, ls="--")
     ax.plot(calib_mkt["mean_pred"], calib_mkt["realized"], "o-", label="market mid", color="#888")
@@ -188,11 +204,12 @@ def _plots(out: Path, calib: pd.DataFrame, calib_mkt: pd.DataFrame, trades: pd.D
     plt.close(fig)
 
     fig, ax = plt.subplots(figsize=(7, 3.5))
-    if not trades.empty:
-        t = trades.sort_values("settle_ts")
-        x = pd.to_datetime(t["settle_ts"], unit="s")
-        ax.plot(x, bankroll + t["pnl"].cumsum(), color="#1f6feb")
-    ax.axhline(bankroll, color="#999", lw=1, ls="--")
+    for tr, label, color in ((base_trades, "no-model baseline", "#999"), (trades, "model", "#1f6feb")):
+        if tr is not None and not tr.empty:
+            t = tr.sort_values("settle_ts")
+            ax.plot(pd.to_datetime(t["settle_ts"], unit="s"), bankroll + t["pnl"].cumsum(), color=color, label=label)
+    ax.legend()
+    ax.axhline(bankroll, color="#ccc", lw=1, ls="--")
     ax.set_title("Equity (test, realized)")
     ax.set_ylabel("$")
     fig.autofmt_xdate()

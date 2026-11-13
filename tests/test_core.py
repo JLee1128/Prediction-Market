@@ -5,7 +5,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from predmkt.backtest import run_backtest
+from predmkt.backtest import longshot_baseline, run_backtest
 from predmkt.book import Book, book_minute_features, book_states, ofi_increment
 from predmkt.config import load_config
 from predmkt.fees import fee_coefs, order_fee
@@ -156,3 +156,43 @@ def test_maker_needs_trade_through(cfg):
     fill = _market("M1", "E1", y=1, p_model=0.70, px_l=0.39)          # a trade prints through 0.40
     trades, stats = run_backtest(fill, cfg, 0.07, 0.0, threshold=0.02, mode="maker")
     assert len(trades) == 1 and trades.iloc[0]["price"] == pytest.approx(0.40) and trades.iloc[0]["fee"] == 0
+
+
+def test_candle_row_live_and_archive_formats():
+    from predmkt.download import candle_row
+    live = {"end_period_ts": 120, "yes_bid": {"close_dollars": "0.4100"}, "yes_ask": {"close_dollars": "0.4300"},
+            "price": {"mean_dollars": "0.4200"}, "volume_fp": "10.00", "open_interest_fp": "5.00"}
+    arch = {"end_period_ts": 120, "yes_bid": {"close": "0.4100"}, "yes_ask": {"close": "0.4300"},
+            "price": {"mean": "0.4200"}, "volume": "10.00", "open_interest": "5.00"}
+    for c in (live, arch):
+        r = candle_row(c, "T")
+        assert (r["bid_c"], r["ask_c"], r["px_mean"], r["volume"], r["oi"]) == (0.41, 0.43, 0.42, 10.0, 5.0)
+
+
+def test_compound_flag(cfg):
+    s = cfg["strategy"]
+    s.update(max_per_market=1e6, max_per_event=1e6, max_open_exposure=1e6)
+    df = pd.concat([_market("M1", "E1", y=1, p_model=0.9, close=10_000),     # wins, then a later event
+                    _market("M2", "E2", y=1, p_model=0.9, close=20_000)])
+    stakes = {}
+    for flag in (False, True):
+        s["compound"] = flag
+        tr, _ = run_backtest(df, cfg, 0.07, 0.0, threshold=0.02, mode="taker")
+        stakes[flag] = tr.set_index("ticker")["outlay"]
+    assert stakes[False]["M2"] == pytest.approx(stakes[False]["M1"], rel=0.01)   # profits not reinvested
+    assert stakes[True]["M2"] > stakes[True]["M1"] * 1.1                         # profits reinvested
+
+
+def test_longshot_baseline(cfg):
+    df = pd.concat([
+        _market("CHEAP_YES", "E1", y=1, p_model=0.5, bid=0.04, ask=0.05),
+        _market("CHEAP_NO", "E2", y=0, p_model=0.5, bid=0.95, ask=0.96),
+        _market("MID", "E3", y=1, p_model=0.5),                       # 40/42c: not a long shot
+    ])
+    tr, _ = longshot_baseline(df, cfg, 0.07, 0.10)
+    got = tr.set_index("ticker")
+    assert set(got.index) == {"CHEAP_YES", "CHEAP_NO"}
+    assert got.loc["CHEAP_YES", "side"] == "yes" and got.loc["CHEAP_YES", "price"] == pytest.approx(0.05)
+    assert got.loc["CHEAP_NO", "side"] == "no" and got.loc["CHEAP_NO", "price"] == pytest.approx(0.05)
+    assert (got["signal_ts"] == df["ts"].min()).all()                 # first decision minute only
+    assert (got["outlay"] <= cfg["strategy"]["max_per_market"] + 1e-9).all()

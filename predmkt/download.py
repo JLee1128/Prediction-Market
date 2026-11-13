@@ -44,18 +44,20 @@ def market_row(m: dict, series: str) -> dict:
     }
 
 
+def _px(d: dict, k: str) -> float:
+    # Live candles label prices "close_dollars"; the historical archive labels them "close".
+    return _f(d.get(f"{k}_dollars", d.get(k)))
+
+
 def candle_row(c: dict, ticker: str) -> dict:
     bid, ask, px = c.get("yes_bid") or {}, c.get("yes_ask") or {}, c.get("price") or {}
     return {
         "ticker": ticker,
         "ts": int(c["end_period_ts"]),
-        "bid_o": _f(bid.get("open_dollars")), "bid_h": _f(bid.get("high_dollars")),
-        "bid_l": _f(bid.get("low_dollars")), "bid_c": _f(bid.get("close_dollars")),
-        "ask_o": _f(ask.get("open_dollars")), "ask_h": _f(ask.get("high_dollars")),
-        "ask_l": _f(ask.get("low_dollars")), "ask_c": _f(ask.get("close_dollars")),
-        "px_o": _f(px.get("open_dollars")), "px_h": _f(px.get("high_dollars")),
-        "px_l": _f(px.get("low_dollars")), "px_c": _f(px.get("close_dollars")),
-        "px_mean": _f(px.get("mean_dollars")),
+        "bid_o": _px(bid, "open"), "bid_h": _px(bid, "high"), "bid_l": _px(bid, "low"), "bid_c": _px(bid, "close"),
+        "ask_o": _px(ask, "open"), "ask_h": _px(ask, "high"), "ask_l": _px(ask, "low"), "ask_c": _px(ask, "close"),
+        "px_o": _px(px, "open"), "px_h": _px(px, "high"), "px_l": _px(px, "low"), "px_c": _px(px, "close"),
+        "px_mean": _px(px, "mean"),
         "volume": _f(c.get("volume_fp", c.get("volume"))),
         "oi": _f(c.get("open_interest_fp", c.get("open_interest"))),
     }
@@ -131,7 +133,10 @@ def download_series(cfg: dict, client: KalshiClient, series: str, days: float) -
             candles += [candle_row(c, m.ticker) for c in client.candles(series, m.ticker, t0, t1, historical=historical)]
             if dcfg["download_trades"]:
                 trades += [trade_row(t) for t in _fetch_trades(client, m.ticker, t0, t1, trades_cut)]
-        pd.DataFrame(candles).to_parquet(out / "candles.parquet", index=False)
+        cdf = pd.DataFrame(candles)
+        if not cdf.empty and cdf["bid_c"].isna().all():
+            log.warning("%s: candles have no bid/ask prices (API field names changed?)", et)
+        cdf.to_parquet(out / "candles.parquet", index=False)
         tdf = pd.DataFrame(trades)
         if not tdf.empty:
             tdf = tdf.drop_duplicates("trade_id")
